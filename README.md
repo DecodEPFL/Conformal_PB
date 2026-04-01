@@ -1,4 +1,4 @@
-# Conformal_PB
+# Conformal Performance Boosting
 ## Implementation Details
 
 ### System and Base Controller Parameters
