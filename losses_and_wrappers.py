@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class PBLoss(nn.Module):
     """
     Base Performance Boosting Loss function.
@@ -108,6 +109,12 @@ class PBLoss(nn.Module):
             exponent_obs = -0.5 * torch.sum((diff_obs ** 2) / self.variance, dim=-1)
             cost_obs = self.lambda_obs * torch.exp(exponent_obs).sum(dim=(2, 3)).mean(dim=1)
 
+        elif self.coll_mode == 'rbf_max':
+            exponent_obs = -0.5 * torch.sum((diff_obs ** 2) / self.variance, dim=-1)
+            rbf_obs = torch.exp(exponent_obs)
+            max_rbf_over_time = rbf_obs.amax(dim=1)  # shape: [batch, n_agents, n_obs]
+            cost_obs = self.lambda_obs * max_rbf_over_time.sum(dim=(1, 2))
+
         elif self.coll_mode == 'shifted_rbf':
             exponent_obs = -0.5 * torch.sum((diff_obs ** 2) / self.variance, dim=-1)
             raw_rbf = torch.exp(exponent_obs)
@@ -115,15 +122,50 @@ class PBLoss(nn.Module):
             shifted_rbf = torch.relu(raw_rbf - rbf_at_margin)
             cost_obs = self.lambda_obs * shifted_rbf.sum(dim=(2, 3)).mean(dim=1)
 
-        elif self.coll_mode == 'hinge':
-            cost_obs = self.lambda_obs * violation_obs.sum(dim=(2, 3)).mean(dim=1)
-
         elif self.coll_mode == 'softplus':
             soft_viol_obs = F.softplus(1.0 - scaled_dist_obs, beta=10.0) * avg_radii
             cost_obs = self.lambda_obs * soft_viol_obs.sum(dim=(2, 3)).mean(dim=1)
 
-        elif self.coll_mode == 'squared_hinge':
+        elif self.coll_mode == 'hinge':
+            cost_obs = self.lambda_obs * violation_obs.sum(dim=(2, 3)).mean(dim=1)
+
+        elif self.coll_mode == 'squared_hinge': #average over horizon
             cost_obs = self.lambda_obs * (violation_obs ** 2).sum(dim=(2, 3)).mean(dim=1)
+
+        elif self.coll_mode == 'max_hinge': #max over horizon
+            # violation_obs shape: [batch_size, horizon, n_agents, n_obstacles]
+
+            # 1. Find the MAXIMUM violation across the time horizon (dim=1)
+            # This mathematically perfectly corresponds to the MINIMUM scaled distance to the center.
+            max_violation_over_time = violation_obs.amax(dim=1)  # shape: [batch, n_agents, n_obs]
+
+            # 2. Sum the worst-case penalties across all agents and obstacles
+            cost_obs = self.lambda_obs * max_violation_over_time.sum(dim=(1, 2))
+
+        elif self.coll_mode == 'min_euclidean_metric':
+            # Compute pure, unscaled Euclidean distance to the center in meters
+            euclidean_dist = torch.norm(diff_obs, p=2, dim=-1)  # [batch, horizon, agents, obs]
+
+            # Find the absolute minimum distance across the entire horizon
+            min_dist_to_center = euclidean_dist.amin(dim=1)  # [batch, agents, obs]
+
+            # You could return this for logging, but do NOT minimize this directly!
+            cost_obs = min_dist_to_center.mean(dim=(1, 2))  # Just aggregating for output
+
+        elif self.coll_mode == 'signed_distance':
+            eps = 1e-12
+            rho = torch.linalg.norm(diff_obs / (self.obs_radii_safe + eps), dim=-1)
+            rho_safe = torch.clamp(rho, min=eps)
+            border_point = self.mu + diff_obs / rho_safe.unsqueeze(-1)
+
+            unsigned_dist = torch.linalg.norm(pos.unsqueeze(3) - border_point, dim=-1)
+            signed_dist = torch.where(rho < 1.0, unsigned_dist, -unsigned_dist)
+
+            min_safe_radius = self.obs_radii_safe.min(dim=-1).values.expand_as(signed_dist)
+            signed_dist = torch.where(rho < 1e-9, min_safe_radius, signed_dist)
+
+            max_signed_dist_over_traj = signed_dist.amax(dim=(1, 2, 3))
+            cost_obs = self.lambda_obs * max_signed_dist_over_traj
 
         else:
             raise ValueError(f"Unknown collision mode: {self.coll_mode}")
@@ -155,6 +197,13 @@ class PBLoss(nn.Module):
                 exponent_agents = -0.5 * (dist_agents_masked ** 2) / var_agents
                 rbf_agents = torch.exp(exponent_agents) * (1.0 - eye)
                 cost_agents = lambda_agent * rbf_agents.sum(dim=(2, 3)).mean(dim=1) / 2.0
+
+            elif self.coll_mode == 'rbf_max':
+                var_agents = (agent_margin / 2.0) ** 2
+                exponent_agents = -0.5 * (dist_agents_masked ** 2) / var_agents
+                rbf_agents = torch.exp(exponent_agents) * (1.0 - eye)
+                max_rbf_agents_over_time = rbf_agents.amax(dim=1)  # shape: [batch, n_agents, n_agents]
+                cost_agents = lambda_agent * max_rbf_agents_over_time.sum(dim=(1, 2)) / 2.0
 
             elif self.coll_mode == 'shifted_rbf':
                 var_agents = (agent_margin / 2.0) ** 2
@@ -213,6 +262,7 @@ class PBLoss(nn.Module):
 
         return total_cost, cost_x, cost_u, cost_coll
 
+
 class ERMWrapper(nn.Module):
     def __init__(self, metric):
         super().__init__()
@@ -258,7 +308,8 @@ class CVaRLossWrapper(nn.Module):
         cvar_loss = self.tau + (1.0 / self.alpha) * torch.mean(excess)
 
         # Return the optimized CVaR loss, plus the standard averages for logging
-        return cvar_loss, cost_x.mean(), cost_u.mean(), cost_coll.mean()
+        return cvar_loss, cost_x.mean(), cost_u.mean(), cvar_loss
+
 
 class SplitCVaRLossWrapper(nn.Module):
     def __init__(self, alpha, lambda_decoupling, metric, tau_init=0.0):
@@ -292,12 +343,13 @@ class SplitCVaRLossWrapper(nn.Module):
         cvar_coll = self.tau + (1.0 / self.alpha) * torch.mean(excess_coll)
 
         # 3. Total Loss
-        total_loss = expected_perf + (self.lambda_decoupling * cvar_coll)
+        total_loss = expected_perf + self.lambda_decoupling * cvar_coll
 
-        return total_loss, cost_x.mean(), cost_u.mean(), cost_coll.mean()
+        return total_loss, cost_x.mean(), cost_u.mean(), cvar_coll
+
 
 class LagrangianCVaRLossWrapper(nn.Module):
-    def __init__(self, alpha, tau_safe_bar, metric, tau_init=0.0, lambda_init=1.0):
+    def __init__(self, alpha, tau_safe_bar, metric, tau_init=0.0, lambda_init=1e-2):
         super().__init__()
         self.alpha = alpha
         self.tau_safe_bar = tau_safe_bar
@@ -307,8 +359,8 @@ class LagrangianCVaRLossWrapper(nn.Module):
         self.tau = nn.Parameter(torch.tensor(tau_init))
 
         # Dual parameter (Maximized).
-        # We optimize a raw value and apply softplus to guarantee lambda >= 0
-        self.pre_lambda = nn.Parameter(torch.tensor(lambda_init))
+        # This parameter is projected to lambda >= 0 by clamping after dual optimizer steps.
+        self.pre_lambda = nn.Parameter(torch.tensor(max(lambda_init, 0.0)))
 
     def forward(self, traj_x, traj_u):
         """
@@ -340,10 +392,11 @@ class LagrangianCVaRLossWrapper(nn.Module):
         constraint_violation = cvar_coll - self.tau_safe_bar
 
         # 4. Lagrangian Formulation
-        lambda_dual = F.softplus(self.pre_lambda)
+        lambda_dual = self.pre_lambda
         lagrangian = expected_perf + (lambda_dual * constraint_violation)
 
         return lagrangian, expected_perf, cvar_coll, lambda_dual, constraint_violation
+
 
 class LagrangianERMLossWrapper(nn.Module):
     def __init__(self, alpha, tau_safe_bar, metric, lambda_init=0.0):
@@ -353,8 +406,8 @@ class LagrangianERMLossWrapper(nn.Module):
         self.metric = metric
 
         # Dual parameter (Maximized).
-        # We optimize a raw value and apply softplus to guarantee lambda >= 0
-        self.pre_lambda = nn.Parameter(torch.tensor(lambda_init))
+        # This parameter is projected to lambda >= 0 by clamping after dual optimizer steps.
+        self.pre_lambda = nn.Parameter(torch.tensor(max(lambda_init, 0.0)))
 
     def forward(self, traj_x, traj_u):
         """
@@ -385,10 +438,11 @@ class LagrangianERMLossWrapper(nn.Module):
         constraint_violation = expected_coll - self.tau_safe_bar
 
         # 4. Lagrangian Formulation
-        lambda_dual = F.softplus(self.pre_lambda)
+        lambda_dual = self.pre_lambda
         lagrangian = expected_perf + (lambda_dual * constraint_violation)
 
         return lagrangian, expected_perf, expected_coll, lambda_dual, constraint_violation
+
 
 class SoftmaxWorstCaseLossWrapper(nn.Module):
     def __init__(self, beta, metric):
@@ -423,6 +477,7 @@ class SoftmaxWorstCaseLossWrapper(nn.Module):
 
         # Return the optimized Softmax loss, plus the standard averages for logging
         return softmax_loss, cost_x.mean(), cost_u.mean(), cost_coll.mean()
+
 
 class PinballLossWrapper(nn.Module):
     def __init__(self, alpha, metric, tau_init=0.0):

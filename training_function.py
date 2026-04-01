@@ -1,6 +1,7 @@
+import copy
 import torch
 import matplotlib.pyplot as plt
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 import copy
 
 def train_agent(
@@ -26,6 +27,13 @@ def train_agent(
 
     print(f"Starting {mode.upper()} online training on {config.device}...")
 
+    dual_lr_multiplier = getattr(config, 'dual_lr_multiplier', 20.0)
+    dual_near_feasible_factor = getattr(config, 'dual_near_feasible_factor', 0.2)
+    dual_feasibility_margin = getattr(config, 'dual_feasibility_margin', 0.02)
+    dual_far_feasible_factor = getattr(config, 'dual_far_feasible_factor', 3.0)
+    dual_far_violation_threshold = getattr(config, 'dual_far_violation_threshold', 0.1)
+    dual_base_lr = config.lr * dual_lr_multiplier
+
     # ==========================================
     # 1. Optimizer Setup
     # ==========================================
@@ -42,25 +50,27 @@ def train_agent(
     elif mode == "lagrangian_mse":
         # No Tau in ERM Lagrangian
         opt_primal = torch.optim.Adam(sim.parameters(), lr=config.lr)
-        opt_dual = torch.optim.Adam([loss_wrapper.pre_lambda], lr=config.lr * 0.1, maximize=True)
+        opt_dual = torch.optim.Adam([loss_wrapper.pre_lambda], lr=dual_base_lr, maximize=True)
 
     elif mode == "lagrangian_cvar":
         opt_primal = torch.optim.Adam([
             {'params': sim.parameters(), 'lr': config.lr},
             {'params': [loss_wrapper.tau], 'lr': config.lr * 10.0}
         ])
-        opt_dual = torch.optim.Adam([loss_wrapper.pre_lambda], lr=config.lr * 0.1, maximize=True)
+        opt_dual = torch.optim.Adam([loss_wrapper.pre_lambda], lr=dual_base_lr, maximize=True)
 
     # ==========================================
     # 2. Tracking Setup & Early Stopping
     # ==========================================
+    # ADDED: 'taus' to the history dictionary
     history = {k: [] for k in
-               ['train_losses', 'val_losses', 'val_targets', 'val_us', 'val_obss', 'val_perfs', 'val_cvars',
-                'val_lambdas']}
+               ['train_losses', 'val_losses', 'val_targets', 'val_us', 'val_obss', 'val_perfs', 'val_colls',
+                'val_lambdas', 'taus']}
 
     best_val_metric = float('inf')
     best_model_state = None
     best_tau = None
+    best_pre_lambda = None
     patience_counter = 0
     patience_limit = config.early_stopping_patience_limit
 
@@ -73,7 +83,6 @@ def train_agent(
         sim.train()
 
         # --- Primal Update ---
-        # Allow multiple inner steps for Lagrangian stability
         n_inner_steps = config.n_inner_steps if "lagrangian" in mode else 1
 
         for _ in range(n_inner_steps):
@@ -89,14 +98,12 @@ def train_agent(
                 loss, _, _, _ = loss_wrapper(traj_x_train, traj_u_train)
                 loss.backward()
                 if config.gradient_clipping is not None:
-                    # --- GRADIENT CLIPPING ADDED HERE ---
                     torch.nn.utils.clip_grad_norm_(sim.parameters(), max_norm=config.gradient_clipping)
                 optimizer.step()
             elif "lagrangian" in mode:
                 loss, _, _, _, _ = loss_wrapper(traj_x_train, traj_u_train)
                 loss.backward()
                 if config.gradient_clipping is not None:
-                    # We clip the controller parameters specifically
                     torch.nn.utils.clip_grad_norm_(sim.parameters(), max_norm=config.gradient_clipping)
                 opt_primal.step()
 
@@ -105,9 +112,27 @@ def train_agent(
             opt_dual.zero_grad()
             batch_w_dual = generate_random_batch(config)
             traj_x_dual, traj_u_dual, _ = sim.run(batch_w_dual)
-            loss_dual, _, _, _, _ = loss_wrapper(traj_x_dual, traj_u_dual)
+            loss_dual, _, _, _, dual_violation = loss_wrapper(traj_x_dual, traj_u_dual)
+
+            dual_violation_value = dual_violation.item() if hasattr(dual_violation, 'item') else float(dual_violation)
+            near_feasible = abs(dual_violation_value) <= dual_feasibility_margin
+            far_from_feasible = dual_violation_value > dual_far_violation_threshold
+
+            if near_feasible:
+                dual_lr_scale = dual_near_feasible_factor
+            elif far_from_feasible:
+                dual_lr_scale = dual_far_feasible_factor
+            else:
+                dual_lr_scale = 1.0
+
+            for group in opt_dual.param_groups:
+                group['lr'] = dual_base_lr * dual_lr_scale
+
             loss_dual.backward()
             opt_dual.step()
+
+            if hasattr(loss_wrapper, 'pre_lambda'):
+                loss_wrapper.pre_lambda.data.clamp_(min=0.0)
 
         # ==========================================
         # 4. Validation & Early Stopping
@@ -130,21 +155,24 @@ def train_agent(
                     pbar.set_postfix({'Val Loss': f"{val_loss.item():.4f}", 'Best': f"{best_val_metric:.4f}"})
 
                 elif "lagrangian" in mode:
-                    val_lag, val_perf, val_cvar, val_lam, val_viol = loss_wrapper(traj_x_val, traj_u_val)
+                    val_lag, val_perf, val_coll, val_lam, val_viol = loss_wrapper(traj_x_val, traj_u_val)
 
                     viol = val_viol.item() if hasattr(val_viol, 'item') else val_viol
                     perf = val_perf.item() if hasattr(val_perf, 'item') else val_perf
 
-                    # Composite metric: prioritize safety, then performance
                     current_metric = perf if viol <= 0 else perf + (1e6 * viol)
 
                     history['train_losses'].append(loss.item())
                     history['val_losses'].append(val_lag.item())
                     history['val_perfs'].append(perf)
-                    history['val_cvars'].append(val_cvar.item() if hasattr(val_cvar, 'item') else val_cvar)
+                    history['val_colls'].append(val_coll.item() if hasattr(val_coll, 'item') else val_coll)
                     history['val_lambdas'].append(val_lam.item() if hasattr(val_lam, 'item') else val_lam)
 
                     pbar.set_postfix({'Perf': f"{perf:.2f}", 'Viol': f"{viol:.4f}", 'Best': f"{best_val_metric:.2f}"})
+
+                # ADDED: Track tau evolution if using CVaR
+                if "cvar" in mode and hasattr(loss_wrapper, 'tau'):
+                    history['taus'].append(loss_wrapper.tau.item())
 
             # Early Stopping Check
             if current_metric < best_val_metric:
@@ -152,6 +180,8 @@ def train_agent(
                 best_model_state = copy.deepcopy(sim.state_dict())
                 if "cvar" in mode and hasattr(loss_wrapper, 'tau'):
                     best_tau = loss_wrapper.tau.item()
+                if "lagrangian" in mode and hasattr(loss_wrapper, 'pre_lambda'):
+                    best_pre_lambda = loss_wrapper.pre_lambda.item()
                 if patience_limit is not None:
                     patience_counter = 0
             else:
@@ -169,6 +199,8 @@ def train_agent(
         sim.load_state_dict(best_model_state)
         if "cvar" in mode and best_tau is not None:
             loss_wrapper.tau.data = torch.tensor(best_tau, device=config.device)
+        if "lagrangian" in mode and best_pre_lambda is not None and hasattr(loss_wrapper, 'pre_lambda'):
+            loss_wrapper.pre_lambda.data = torch.tensor(best_pre_lambda, device=config.device)
         print(f"\nRestored best model (Metric: {best_val_metric:.4f}).")
 
     with torch.no_grad():
@@ -178,44 +210,66 @@ def train_agent(
         steps = range(config.log_interval, len(history['val_losses']) * config.log_interval + 1, config.log_interval)
 
         if "standard" in mode:
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 5))
-            ax1.plot(steps, history['train_losses'], label='Train Loss', color='blue')
-            ax1.plot(steps, history['val_losses'], label='Val Loss', color='orange', linestyle='--')
-            ax1.set_title(f'{mode.replace("_", " ").title()} Progress')
-            ax1.legend()
-            ax1.grid(True)
+            # ADDED: Expand to 3 subplots if CVaR is used
+            num_plots = 3 if "cvar" in mode else 2
+            fig, axes = plt.subplots(1, num_plots, figsize=(8 * num_plots, 5))
 
-            ax2.plot(steps, history['val_targets'], label='Target Tracking', color='green')
-            ax2.plot(steps, history['val_us'], label='Control Effort', color='purple')
-            ax2.plot(steps, history['val_obss'], label='Obstacle Avoidance', color='red')
-            ax2.set_title('Validation Breakdown')
-            ax2.legend()
-            ax2.grid(True)
+            axes[0].plot(steps, history['train_losses'], label='Train Loss', color='blue')
+            axes[0].plot(steps, history['val_losses'], label='Val Loss', color='orange', linestyle='--')
+            axes[0].set_title(f'{mode.replace("_", " ").title()} Progress')
+            axes[0].legend()
+            axes[0].grid(True)
+
+            axes[1].plot(steps, history['val_targets'], label='Target Tracking', color='green')
+            axes[1].plot(steps, history['val_us'], label='Control Effort', color='purple')
+            obs_label = 'CVaR Obstacle Avoidance' if 'cvar' in mode else 'Mean Obstacle Avoidance'
+            axes[1].plot(steps, history['val_obss'], label=obs_label, color='red')
+            axes[1].set_title('Validation Breakdown')
+            axes[1].legend()
+            axes[1].grid(True)
+
+            if "cvar" in mode:
+                axes[2].plot(steps, history['taus'], label='Tau (VaR Base)', color='brown', linewidth=2)
+                axes[2].set_title('Evolution of Tau (Quantile Base)')
+                axes[2].legend()
+                axes[2].grid(True)
+
             plt.tight_layout()
             plt.show()
 
         elif "lagrangian" in mode:
-            fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
-            ax1.plot(steps, history['train_losses'], label='Train Lagrangian', color='blue')
-            ax1.plot(steps, history['val_losses'], label='Val Lagrangian', color='orange', linestyle='--')
-            ax1.set_title(f'{mode.replace("_", " ").title()} Min-Max')
-            ax1.legend()
-            ax1.grid(True)
+            # ADDED: Expand to 4 subplots if CVaR is used
+            num_plots = 4 if "cvar" in mode else 3
+            fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 5))
 
-            ax2.plot(steps, history['val_perfs'], label='Expected Perf', color='green')
-            ax2.plot(steps, history['val_cvars'], label='Collision Safety', color='red')
+            axes[0].plot(steps, history['train_losses'], label='Train Lagrangian', color='blue')
+            axes[0].plot(steps, history['val_losses'], label='Val Lagrangian', color='orange', linestyle='--')
+            axes[0].set_title(f'{mode.replace("_", " ").title()} Min-Max')
+            axes[0].legend()
+            axes[0].grid(True)
+
+            axes[1].plot(steps, history['val_perfs'], label='Expected Perf', color='green')
+            obs_label = 'CVaR Obstacle Avoidance' if 'cvar' in mode else 'Mean Obstacle Avoidance'
+            axes[1].plot(steps, history['val_colls'], label=obs_label, color='red')
             if hasattr(loss_wrapper, 'tau_safe_bar'):
                 t_bar = loss_wrapper.tau_safe_bar.item() if hasattr(loss_wrapper.tau_safe_bar,
                                                                     'item') else loss_wrapper.tau_safe_bar
-                ax2.axhline(y=t_bar, color='red', linestyle=':', label='Max Safe Target (Tau_bar)')
-            ax2.set_title('Perf vs. Safety')
-            ax2.legend()
-            ax2.grid(True)
+                axes[1].axhline(y=t_bar, color='red', linestyle=':', label='Max Safe Target (Tau_bar)')
+            axes[1].set_title('Perf vs. Safety')
+            axes[1].legend()
+            axes[1].grid(True)
 
-            ax3.plot(steps, history['val_lambdas'], label='Lambda (Dual)', color='purple')
-            ax3.set_title('Dual Variable')
-            ax3.legend()
-            ax3.grid(True)
+            axes[2].plot(steps, history['val_lambdas'], label='Lambda (Dual)', color='purple')
+            axes[2].set_title('Dual Variable')
+            axes[2].legend()
+            axes[2].grid(True)
+
+            if "cvar" in mode:
+                axes[3].plot(steps, history['taus'], label='Tau (VaR Base)', color='brown', linewidth=2)
+                axes[3].set_title('Evolution of Tau (Quantile Base)')
+                axes[3].legend()
+                axes[3].grid(True)
+
             plt.tight_layout()
             plt.show()
 
