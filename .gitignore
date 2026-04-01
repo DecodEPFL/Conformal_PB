@@ -82,8 +82,14 @@ target/
 profile_default/
 ipython_config.py
 
-# Figures
+# PyTorch checkpoints and model files
+*.pt
+*_checkpoints/
+*_checkpoints\ copy/
+
+# Generated figures and outputs
 *.pdf
+figures/
 
 # macOS
 .DS_Store
