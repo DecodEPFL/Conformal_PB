@@ -118,15 +118,6 @@ The approach demonstrates that risk-aware CVaR-based training effectively promot
 
 See `main.ipynb` for detailed results, Pareto curves, and trajectory visualizations.
 
-## References
-
-Key papers and implementations:
-
-- Meroi, L., El Amrani, S., Saccani, D., Piga, D., & Ferrari-Trecate, G. (2026). *Risk-aware stability-preserving design of neural controllers with conformal verification*.
-- Furieri, L., Galimberti, C. L., & Ferrari-Trecate, G. (2024). Learning to boost the performance of stable nonlinear systems. *IEEE Open Journal of Control Systems*, 3, 342–357.
-- Revay, M., Wang, R., & Manchester, I. (2023). Recurrent equilibrium networks: Flexible dynamic models with guaranteed stability and robustness. *IEEE Transactions on Automatic Control*, 69(5), 2855–2870.
-- Lindemann, L., Zhao, Y., Yu, X., Pappas, G. J., & Deshmukh, J. (2025). Formal verification and control with conformal prediction. *IEEE Control Systems*, 45(6), 72–122.
-
 ## Authors & Acknowledgments
 
 **Authors**: Laura Meroi, Sabri El Amrani, Danilo Saccani, Dario Piga, Giancarlo Ferrari-Trecate
